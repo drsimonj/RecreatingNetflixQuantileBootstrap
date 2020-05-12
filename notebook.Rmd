@@ -1,0 +1,391 @@
+---
+title: "Recreating Netflix's quantile bootstrapping technique in R"
+output:
+  html_document
+---
+
+This notebook is a full code walkthrough of me Recreating Netflix's quantile bootstrapping technique in R. The details of this analysis are published in [this article on medium](TBC).
+
+# General setup
+```{r knit_setup}
+knitr::opts_chunk$set(
+  comment = "#>",
+  fig.path = "temp/"
+)
+```
+```{r setup_packages}
+# Will be making heavy use of the tidyverse
+library(tidyverse)
+```
+```{r setup_plots}
+# Set default theme as minimal
+theme_set(theme_minimal())
+```
+```{r}
+# Set a seed to make the analysis reproducible
+set.seed(20200511)
+```
+
+
+# Prep
+
+## Simulating data
+
+```{r}
+x <- rchisq(n = 200, df = 8)
+```
+```{r simulated_data_histogram}
+tibble(x) %>% 
+  ggplot(aes(x)) +
+    geom_histogram(bins = 50)
+```
+
+## Getting Quantiles
+
+```{r}
+quantile_df <- tibble(percentile = seq(0, 1, by = .2)) %>% 
+  mutate(value = quantile(x, percentile))
+quantile_df
+```
+
+# Checkin: we can do a bit already
+
+```{r}
+# Simulate data sets. For treatment, we'll bind two distributions skewed either
+# side of production
+x_production <- rchisq(200, 8)
+x_treatment  <- c(rchisq(100, 12), rchisq(100, 4))
+```
+```{r}
+group_quantiles_df <- tibble(percentile = seq(0, 1, by = .2)) %>% 
+  mutate(production = quantile(x_production, percentile),
+         treatment  = quantile(x_treatment, percentile))
+group_quantiles_df
+```
+
+```{r quantile_comparison_absolute}
+group_quantiles_df %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile, value)) +
+    geom_line(aes(group = group, color = group),
+                size = 2) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Quantile values for two data sets") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+```{r quantile_comparison_relative}
+group_quantiles_df %>% 
+  mutate(treatment = treatment - production,
+         production = 0) %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile, value)) +
+    geom_line(aes(group = group, color = group),
+              size = 2) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Difference to production data at various quantiles") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+# Bootstrapping quantile differences
+
+```{r}
+x_bootstrap <- sample(x, replace = TRUE)
+```
+```{r single_bootstrap_comparison}
+tibble(x, x_bootstrap) %>% 
+  pivot_longer(c(x, x_bootstrap)) %>% 
+  ggplot(aes(value, fill = name)) +
+    geom_histogram(bins = 50, alpha = .7, position = "identity") +
+    labs(fill = NULL) +
+    ggtitle("Distribution of x and a bootstrapped sample of it") +
+    scale_fill_manual(values = c("black", "green")) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+```{r}
+n_bootstraps <- 100
+quantile_df_template <- tibble(percentile = seq(0, 1, by = .2))
+
+bootstrapped_quantiles <- map_df(seq_len(n_bootstraps), function(i) {
+  bootstrapped_production <- sample(x_production, replace = TRUE)
+  bootstrapped_treatment  <- sample(x_treatment, replace = TRUE)
+  
+  quantile_df_template %>%
+    mutate(bootstrap = i,
+           production = quantile(bootstrapped_production, percentile),
+           treatment  = quantile(bootstrapped_treatment, percentile))
+})
+```
+```{r}
+bootstrapped_quantiles
+```
+
+```{r boostrapped_versions_of_data}
+bootstrapped_quantiles %>% 
+  ggplot(aes(percentile, production)) +
+    geom_line(data = group_quantiles_df, size = 3) +
+    #geom_line(aes(group = bootstrap), alpha = .1, color = "green") +
+    #geom_violin(aes(group = percentile)) +
+    stat_summary(fun = mean, fun.min = min, fun.max = max, colour = "red", size = .5) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Production data (black) and range of bootstrapped versions of it (red)") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+```{r simple_range_overlay}
+group_quantiles_df %>% 
+  mutate(treatment = treatment - production,
+         production = 0) %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile, value)) +
+    geom_line(aes(group = group, color = group),
+              size = 2) +
+    stat_summary(fun = mean, fun.min = min, fun.max = max, colour = "red", size = .5,
+                 data = mutate(bootstrapped_quantiles, treatment = treatment - production),
+                 aes(y = treatment)) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Difference to production data with bootstrap ranges") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+# Bootstrapping Confidence Intervals
+
+```{r}
+bootstrapped_cis <- bootstrapped_quantiles %>% 
+  mutate(q_dif = treatment - production) %>% 
+  group_by(percentile) %>% 
+  summarise(lower_bound = quantile(q_dif, .025),
+            upper_bound = quantile(q_dif, .975))
+
+bootstrapped_cis
+```
+
+
+```{r ci_overlay}
+group_quantiles_df %>% 
+  mutate(treatment = treatment - production,
+         production = 0) %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile)) +
+    geom_ribbon(data = bootstrapped_cis,
+                aes(ymin = lower_bound, ymax = upper_bound),
+                fill = "purple", alpha = .2) +
+    geom_line(aes(y = value, group = group, color = group),
+              size = 2) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Difference to production data with bootstrapped confidence intervals") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+# Bump up the numbers
+
+```{r}
+n_units <- 1000
+quantile_seq <- seq(0, 1, by = .01)
+n_bootstraps <- 1000
+
+x_production <- rchisq(n_units, 8)
+x_treatment  <- c(rchisq(n_units/2, 12), rchisq(n_units/2, 4))
+
+group_quantiles_df <- tibble(percentile = quantile_seq) %>% 
+  mutate(production = quantile(x_production, percentile),
+         treatment  = quantile(x_treatment, percentile))
+
+quantile_df_template <- tibble(percentile = quantile_seq)
+
+bootstrapped_quantiles <- map_df(seq_len(n_bootstraps), function(i) {
+  bootstrapped_production <- sample(x_production, replace = TRUE)
+  bootstrapped_treatment  <- sample(x_treatment, replace = TRUE)
+  
+  quantile_df_template %>%
+    mutate(bootstrap = i,
+           production = quantile(bootstrapped_production, percentile),
+           treatment  = quantile(bootstrapped_treatment, percentile))
+})
+
+bootstrapped_cis <- bootstrapped_quantiles %>% 
+  mutate(q_dif = treatment - production) %>% 
+  group_by(percentile) %>% 
+  summarise(lower_bound = quantile(q_dif, .025),
+            upper_bound = quantile(q_dif, .975))
+```
+
+```{r ci_overlay_nup}
+group_quantiles_df %>% 
+  mutate(treatment = treatment - production,
+         production = 0) %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile)) +
+    geom_ribbon(data = bootstrapped_cis,
+                aes(ymin = lower_bound, ymax = upper_bound),
+                fill = "purple", alpha = .2) +
+    geom_line(aes(y = value, group = group, color = group),
+              size = 2) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Difference to production data with bootstrapped confidence intervals") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+# Time to get (more) technical
+
+## Multiple Comparisons
+```{r}
+bootstrapped_quantiles
+```
+
+```{r}
+# Sum of the correlations between bootstrapped differences at each quantile
+cor_sum <- bootstrapped_quantiles %>%
+  transmute(bootstrap, percentile, q_dif = treatment - production) %>% 
+  pivot_wider(names_from = percentile, values_from = q_dif) %>% 
+  select(-bootstrap) %>% 
+  cor() %>% 
+  .[-upper.tri(.)] %>% 
+  sum()
+```
+```{r}
+# Estimated number of independent tests
+n_tests_estimate <- length(quantile_seq) ^ 2 / cor_sum
+n_tests_estimate
+
+# Bonferroni adjusted confidence interval
+error_rate <- 0.05
+adjusted_error_rate <- error_rate / n_tests_estimate
+adjusted_error_rate
+```
+
+```{r}
+1 - adjusted_error_rate
+```
+
+
+```{r}
+bootstrapped_cis_adj <- bootstrapped_quantiles %>% 
+  mutate(q_dif = treatment - production) %>% 
+  group_by(percentile) %>% 
+  summarise(lower_bound = quantile(q_dif, adjusted_error_rate/2),
+            upper_bound = quantile(q_dif, 1 - (adjusted_error_rate / 2)))
+
+bootstrapped_cis_adj
+```
+
+```{r ci_adjusted}
+group_quantiles_df %>% 
+  mutate(treatment = treatment - production,
+         production = 0) %>% 
+  pivot_longer(-percentile, names_to = "group") %>% 
+  ggplot(aes(percentile)) +
+  geom_ribbon(data = bootstrapped_cis_adj,
+                aes(ymin = lower_bound, ymax = upper_bound),
+                fill = "green", alpha = .2) +
+    geom_ribbon(data = bootstrapped_cis,
+                aes(ymin = lower_bound, ymax = upper_bound),
+                fill = "purple", alpha = .2) +
+    geom_line(aes(y = value, group = group, color = group),
+              size = 2) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Difference to production data with two types of confidence intervals",
+            subtitle = "Proper, Bonferroni-adjusted confidence intervals in green") +
+    scale_color_manual(values = c("black", "purple")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+## Fast Bootstrapping on Big Data
+
+```{r}
+n_buckets <- 100
+
+compressed_data <- tibble(production = x_production, treatment = x_treatment) %>% 
+  pivot_longer(c(production, treatment), names_to = "group", values_to = "x") %>% 
+  group_by(group) %>% 
+  mutate(x_bucket = cut_number(x, n_buckets)) %>% 
+  group_by(group, x_bucket) %>% 
+  summarise(count = n(),
+            x = median(x)) %>%
+  ungroup()
+
+compressed_data
+```
+
+```{r}
+# Adding cumulative percentile to make search easier
+compressed_data <- compressed_data %>% 
+  group_by(group) %>% 
+  arrange(x) %>% 
+  mutate(cum_percentile = cumsum(count) / sum(count)) %>% 
+  ungroup()
+
+compressed_data
+```
+```{r}
+# Function we can reuse to get `x` quantile from the compressed data
+x_at_percentile <- function(percentile, compressed_df) {
+  i <- 1
+  while (compressed_df$cum_percentile[i] < percentile) {
+    i <- i + 1
+  }
+  return (compressed_df$x[i])
+}
+```
+```{r}
+compressed_data %>% 
+  filter(group == "production") %>% 
+  x_at_percentile(.5, .)
+```
+
+
+```{r}
+#' Try small comparison of approaches for `production` data
+quantile_df <- tibble(percentile = seq(0, 1, by = .01)) %>%
+  mutate(original = quantile(x_production, percentile)) %>%
+  mutate(compressed = map_dbl(
+    percentile,
+    x_at_percentile,
+    filter(compressed_data, group == "production")
+  ))
+```
+```{r original_v_compressed}
+quantile_df %>% 
+  pivot_longer(-percentile) %>% 
+  ggplot(aes(percentile, value)) +
+    geom_line(aes(group = name, color = name), size = 2, alpha = .8) +
+    labs(x = "Percentile", y = "Value", color = NULL) +
+    ggtitle("Quantiles from original (black) and compressed (green) data") +
+    scale_color_manual(values = c("green", "black")) +
+    scale_x_continuous(lim = c(0, 1), labels = scales::percent_format()) +
+    theme(legend.text = element_text(size = 14),
+          legend.position = "top")
+```
+
+```{r}
+compressed_data %>% 
+  filter(group == "production") %>% 
+  sample_n(n(), replace = TRUE) %>% 
+  arrange(x) %>% 
+  mutate(cum_percentile = cumsum(count) / sum(count))
+```
+
+
+# Putting it all together
